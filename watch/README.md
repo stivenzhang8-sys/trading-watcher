@@ -65,10 +65,14 @@
 - Manual run: `gh workflow run watcher.yml -R stivenzhang8-sys/trading-watcher -f dry_run=true` (no POST, state untouched)
   or `-f dry_run=false` (real pass). Runs: `gh run list -R stivenzhang8-sys/trading-watcher -w watcher.yml`.
 - Box copy while the cloud is active: `watch.env` has `CLOUD_WATCHER=1` -> the box daemon keeps scanning and logging
-  but never POSTs (flags logged as `not_configured (box log-only: CLOUD_WATCHER=1)`, no pending.jsonl entries).
-  The flag is re-read every cycle (no restart needed). Fallback if GitHub Actions breaks: set `CLOUD_WATCHER=0` in
-  watch.env (or delete the line), then `bash ensure_running.sh`; disable the cloud schedule with
-  `gh workflow disable watcher.yml -R stivenzhang8-sys/trading-watcher` to avoid double wakes.
+  but never POSTs (flags logged as `not_configured (box log-only: CLOUD_WATCHER=1)`, no pending.jsonl entries),
+  as long as the cloud is healthy: every 10 min the box asks `gh run list` for the newest successful *scheduled*
+  watcher run; if there is none within 45 min (schedule stalled/disabled, Actions outage, gh unreachable > 1h),
+  the box automatically resumes sending webhooks (log line `cloud watcher NOT healthy ... ACTIVE (fallback)`) and
+  stops again once the cloud is back (`cloud watcher healthy`). Around a transition a flag can be sent by both
+  (separate cooldowns). The flag is re-read every cycle (no restart needed); `WATCH_CLOUD_HEALTHCHECK=0` disables the
+  heartbeat check. Manual fallback: set `CLOUD_WATCHER=0` in watch.env (or delete the line), `bash ensure_running.sh`,
+  and `gh workflow disable watcher.yml -R stivenzhang8-sys/trading-watcher` to avoid double wakes.
 - Code changes: /workspace/trading is the git checkout (whitelist .gitignore: only watcher/tp/watchlist files are
   published; journals, trades.csv, state, watch.env, tools/account.local.json never). `git pull --rebase` before
   pushing (keepalive commits monthly). Account-size values for tp.py live in tools/account.local.json (box only).

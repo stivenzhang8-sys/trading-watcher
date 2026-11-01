@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Offline tests for watcher.py cooldown / cap / session / rule logic. Never POSTs."""
-import datetime as dt, os, sys
+import datetime as dt, os, sys, time
 os.environ.pop("WATCH_WEBHOOK_URL", None); os.environ.pop("WATCH_WEBHOOK_AUTH", None)
-os.environ["CLOUD_WATCHER"] = "0"   # tests must not depend on the box's watch.env flag
+os.environ["CLOUD_WATCHER"] = "0"; os.environ["WATCH_CLOUD_HEALTHCHECK"] = "0"   # tests must not depend on the box's watch.env flag
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import watcher as w, tempfile
 _T = tempfile.mkdtemp()
@@ -185,6 +185,12 @@ def test_cloud_watcher_flag_makes_box_log_only():
         assert w.webhook_cfg()[0] == ""
         r = w.handle_flags([fl(sym="ZZZ")], st(), QUIET, poster=lambda p: (_ for _ in ()).throw(AssertionError("posted")))
         assert r[0]["action"] == "not_configured"
+        os.environ["WATCH_CLOUD_HEALTHCHECK"] = "1"   # stale/unreachable cloud -> box falls back to sending
+        w._cloud_hc.update(ts=time.time(), ok=False, ok_ts=0.0)
+        assert w.webhook_cfg()[0] != ""
+        w._cloud_hc.update(ok=True)
+        assert w.webhook_cfg()[0] == ""
+        os.environ["WATCH_CLOUD_HEALTHCHECK"] = "0"
         w.CLOUD = True                      # inside the cloud run the flag is ignored
         assert w.webhook_cfg()[0] != ""
     finally:

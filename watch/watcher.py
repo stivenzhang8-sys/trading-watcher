@@ -65,11 +65,12 @@ def load_env_file(path=ENVFILE):
         k = k.strip().replace("export ", "")
         os.environ.setdefault(k, v.strip().strip('"').strip("'"))
 
-def cloud_watcher_active():
-    """True when CLOUD_WATCHER=1 (process env first, else watch.env re-read every call, so flipping the
-    flag in watch.env takes effect without a restart). Never true inside the cloud run itself."""
-    if CLOUD:
-        return False
+CLOUD_REPO = os.environ.get("WATCH_REPO", "stivenzhang8-sys/trading-watcher")
+CLOUD_STALE_MIN = 45        # box resumes webhooks if no successful scheduled cloud run within this window
+_cloud_hc = {"ts": 0.0, "ok": None, "ok_ts": 0.0, "why": ""}
+
+def _cloud_flag():
+    """CLOUD_WATCHER=1 from process env, else watch.env (re-read every call: no restart needed)."""
     v = os.environ.get("CLOUD_WATCHER")
     if v is None and os.path.exists(ENVFILE):
         for line in open(ENVFILE):
@@ -77,6 +78,50 @@ def cloud_watcher_active():
             if line.startswith("CLOUD_WATCHER="):
                 v = line.split("=", 1)[1].strip().strip('"').strip("'")
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+def cloud_healthy():
+    """Heartbeat: newest successful *scheduled* run of watcher.yml is < CLOUD_STALE_MIN old (gh CLI, checked
+    at most every 10 min). If GitHub's schedule stalls, the box automatically resumes sending webhooks.
+    gh errors keep the last good answer for 60 min, then count as unhealthy. WATCH_CLOUD_HEALTHCHECK=0 disables."""
+    if os.environ.get("WATCH_CLOUD_HEALTHCHECK", "1") == "0":
+        return True
+    now = time.time()
+    if _cloud_hc["ok"] is not None and now - _cloud_hc["ts"] < 600:
+        return _cloud_hc["ok"]
+    import subprocess
+    ok, why = None, ""
+    try:
+        out = subprocess.run(["gh", "run", "list", "-R", CLOUD_REPO, "-w", "watcher.yml", "-e", "schedule",
+                              "-s", "success", "-L", "1", "--json", "createdAt,updatedAt"],
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode == 0:
+            runs = json.loads(out.stdout or "[]")
+            if runs:
+                t = max(dt.datetime.fromisoformat(runs[0][k].replace("Z", "+00:00")).timestamp()
+                        for k in ("createdAt", "updatedAt"))
+                age = (now - t) / 60
+                ok, why = age < CLOUD_STALE_MIN, f"last scheduled success {age:.0f} min ago"
+            else:
+                ok, why = False, "no successful scheduled cloud run yet"
+        else:
+            why = "gh error: " + (out.stderr or "").strip()[:120]
+    except Exception as e:
+        why = f"gh error: {e}"[:140]
+    if ok is None:   # could not check
+        ok = bool(_cloud_hc["ok"]) and now - _cloud_hc["ok_ts"] < 3600
+    if ok != _cloud_hc["ok"]:
+        log.info("cloud watcher %s (%s): box webhooks %s", "healthy" if ok else "NOT healthy", why,
+                 "suppressed" if ok else "ACTIVE (fallback)")
+    _cloud_hc.update(ts=now, ok=ok, why=why)
+    if ok:
+        _cloud_hc["ok_ts"] = now
+    return ok
+
+def cloud_watcher_active():
+    """True when CLOUD_WATCHER=1 and the GitHub Actions schedule is alive. Never true inside the cloud run."""
+    if CLOUD:
+        return False
+    return _cloud_flag() and cloud_healthy()
 
 def setup_logging(verbose=True, file=True):
     log.setLevel(logging.INFO)
@@ -582,7 +627,7 @@ def daemon():
         f.write(str(os.getpid()))
     url, _ = webhook_cfg()
     log.info("watcher started pid %d; webhook %s", os.getpid(),
-             "suppressed (CLOUD_WATCHER=1, log-only)" if cloud_watcher_active() else ("configured" if url else "not configured"))
+             "suppressed (CLOUD_WATCHER=1 and cloud healthy, log-only)" if cloud_watcher_active() else (("ACTIVE: CLOUD_WATCHER=1 but cloud schedule not healthy, fallback") if _cloud_flag() else ("configured" if url else "not configured")))
     try:
         seed_baseline(load_state())
     except Exception as e:
