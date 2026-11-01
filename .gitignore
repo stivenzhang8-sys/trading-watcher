@@ -1,0 +1,18 @@
+# WHITELIST: this directory also holds private trading data (journals, trades.csv, state, keys in env).
+# Only the files below are published (public repo). Never add journals, trades.csv, state or *.env.
+/*
+!/.gitignore
+!/README.md
+!/.github/
+!/watch/
+!/tools/
+/watch/*
+!/watch/watcher.py
+!/watch/pending.py
+!/watch/test_watcher.py
+!/watch/README.md
+!/watch/ensure_running.sh
+!/watch/sync_positions.sh
+/tools/*
+!/tools/tp.py
+!/tools/watchlist.txt

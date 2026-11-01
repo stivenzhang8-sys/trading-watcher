@@ -1,0 +1,120 @@
+# Cloud copy of watch/watcher.py: one check pass every 10 minutes (GitHub may delay or skip scheduled runs).
+# Public repo: never print position details; state is encrypted before it goes into the Actions cache.
+name: watcher
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: no webhook POST, state not saved, lists everything that qualifies right now'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write          # prune old state caches
+
+concurrency:
+  group: watcher          # runs never overlap, so the state chain stays linear
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      TZ: Europe/Rome
+      PYTHONUNBUFFERED: '1'
+      DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # tools/tp.py + watcher are stdlib-only: nothing to pip-install, so no pip cache is needed.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Restore watcher state (encrypted)
+        uses: actions/cache/restore@v6
+        with:
+          path: .wstate-enc
+          key: watch-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: watch-state-
+
+      - name: Restore Yahoo daily-bar cache
+        id: yahoo
+        uses: actions/cache/restore@v6
+        with:
+          path: tools/cache/yahoo
+          key: yahoo-${{ github.run_id }}
+          restore-keys: yahoo-
+
+      - name: Decrypt state
+        env:
+          STATE_KEY: ${{ secrets.WATCH_STATE_KEY }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/wstate"
+          if [ ! -f .wstate-enc/state.tar.enc ]; then echo "no saved state (first run): fresh state"; exit 0; fi
+          if [ -z "$STATE_KEY" ]; then echo "::warning::WATCH_STATE_KEY secret missing: fresh state"; exit 0; fi
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:STATE_KEY -in .wstate-enc/state.tar.enc \
+            | tar -xz -C "$RUNNER_TEMP/wstate" && echo "state restored" \
+            || echo "::warning::state decrypt failed: fresh state"
+
+      - name: Watcher pass
+        env:
+          POSITIONS_JSON: ${{ secrets.POSITIONS_JSON }}
+          WATCH_WEBHOOK_URL: ${{ secrets.WATCH_WEBHOOK_URL }}
+          WATCH_WEBHOOK_AUTH: ${{ secrets.WATCH_WEBHOOK_AUTH }}
+        run: |
+          args="--cloud --state-dir $RUNNER_TEMP/wstate"
+          [ "$DRY_RUN" = "1" ] && args="$args --dry-run"
+          python3 watch/watcher.py $args
+
+      - name: Encrypt state
+        if: always() && env.DRY_RUN != '1'
+        env:
+          STATE_KEY: ${{ secrets.WATCH_STATE_KEY }}
+        run: |
+          [ -n "$STATE_KEY" ] || { echo "::warning::WATCH_STATE_KEY missing: state not saved"; exit 0; }
+          [ -f "$RUNNER_TEMP/wstate/state.json" ] || { echo "no state written"; exit 0; }
+          mkdir -p .wstate-enc
+          tar -cz -C "$RUNNER_TEMP/wstate" . \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:STATE_KEY -out .wstate-enc/state.tar.enc
+          ls -l .wstate-enc
+
+      - name: Save watcher state
+        if: always() && env.DRY_RUN != '1' && hashFiles('.wstate-enc/state.tar.enc') != ''
+        uses: actions/cache/save@v6
+        with:
+          path: .wstate-enc
+          key: watch-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Hash Yahoo cache
+        id: yhash
+        if: always()
+        run: |
+          h=$(find tools/cache/yahoo -name '*.json' -type f 2>/dev/null | sort | xargs -r sha1sum | sha1sum | cut -c1-16)
+          n=$(find tools/cache/yahoo -name '*.json' -type f 2>/dev/null | wc -l)
+          echo "key=yahoo-$h" >> "$GITHUB_OUTPUT"; echo "n=$n" >> "$GITHUB_OUTPUT"
+          echo "yahoo cache: $n files, restored=${{ steps.yahoo.outputs.cache-matched-key }}"
+
+      - name: Save Yahoo cache (only when it changed)
+        if: always() && steps.yhash.outputs.n != '0' && steps.yhash.outputs.key != steps.yahoo.outputs.cache-matched-key
+        uses: actions/cache/save@v6
+        with:
+          path: tools/cache/yahoo
+          key: ${{ steps.yhash.outputs.key }}
+
+      - name: Prune old caches (hourly)
+        if: always() && env.DRY_RUN != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$(date -u +%M | sed 's/^0//')" -lt 10 ] || exit 0
+          for p in watch-state- yahoo-; do
+            gh cache list -R "$GITHUB_REPOSITORY" --key "$p" --sort created_at --order desc --limit 100 --json id --jq '.[5:][].id' \
+              | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY" || true
+          done
