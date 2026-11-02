@@ -396,7 +396,20 @@ def kraken_daily(pair):
     return h, l, c, int(rows[-1][0])
 
 def kraken_tickers(pairs):
-    res = kraken_public("Ticker", pair=",".join(pairs))
+    try:
+        res = kraken_public("Ticker", pair=",".join(pairs))
+    except RuntimeError as e:
+        # One unknown pair (e.g. a tokenized asset like AAPLx.T with no EUR spot pair) fails the whole
+        # batch: retry one by one and skip the pairs Kraken doesn't know.
+        if "Unknown asset pair" not in str(e):
+            raise
+        res = {}
+        for p in pairs:
+            try:
+                res.update(kraken_public("Ticker", pair=p))
+            except RuntimeError as e1:
+                if "Unknown asset pair" not in str(e1):
+                    raise
     info = kraken_pairinfo()
     out = {}
     for k, v in res.items():
