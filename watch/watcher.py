@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""watcher.py - lightweight, no-AI price watcher for Stiven's Kraken + Trading 212 setup.
+"""watcher.py - lightweight, no-AI price watcher for a Kraken (spot) + Trading 212 setup.
 
 Read-only: Kraken PUBLIC market data + Yahoo chart data (same sources/logic as tools/tp.py scan).
 Never uses API keys, never places orders. When a symbol newly passes / nearly passes the scan's
@@ -12,7 +12,8 @@ Usage (from anywhere):
   python3 watcher.py --once --dry-run --all-markets   # also scan stocks while markets are closed
   python3 watcher.py --test-post              # one connectivity POST (account 'test')
   python3 watcher.py --cloud --state-dir DIR  # GitHub Actions: one pass, positions from env POSITIONS_JSON,
-                                              # state + pending queue in DIR, position details redacted in logs
+                                              # state + pending queue in DIR; logs show counts only
+                                              # (no symbols), full details go to the webhook only
 Env: WATCH_WEBHOOK_URL, WATCH_WEBHOOK_AUTH (optional; else alerts are only logged).
      CLOUD_WATCHER=1 (env or watch.env): the GitHub Actions watcher is active -> this box copy never POSTs (log-only).
 """
@@ -383,12 +384,41 @@ def position_flags(trades, prices, account, state):
                               metrics=met, _level_key=lk))
     return flags
 
+def _held_keys(trades):
+    keys = set()
+    for t in trades:
+        p = str(t.get("pair") or "")
+        if p:
+            keys.add(p.upper())
+            try:
+                keys.add(str(tp.norm_pair(p)).upper())
+            except Exception:
+                pass
+    return keys
+
+def mask_text(text, held):
+    """Replace held-position symbols in free text (cloud logs are public)."""
+    text = str(text)
+    for k in sorted(held, key=len, reverse=True):
+        text = re.sub(r"(?i)(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])", "(position)", text)
+    return text
+
+def log_scan_errors(kind, errs, trades):
+    """Box: log errors as-is. Cloud (public Actions logs): drop keys of held positions, report them only as a count."""
+    if not errs:
+        return
+    if not CLOUD:
+        log.warning("%s scan errors: %s", kind, errs); return
+    held = _held_keys(trades)
+    pub = {k: mask_text(v, held) for k, v in errs.items() if str(k).upper() not in held}
+    n_pos = len(errs) - len(pub)
+    log.warning("%s scan errors: %s%s", kind, pub or "{}", f" (+{n_pos} position symbol error(s))" if n_pos else "")
+
 def crypto_cycle(state):
-    rows, errs = tp.scan_crypto(list(tp.CRYPTO_PAIRS), scan_args())
-    if errs:
-        log.warning("crypto scan errors: %s", errs)
-    flags = candidate_flags(rows, "crypto", state, "kraken")
     trades = [t for t in open_trades() if t["account"] == "kraken"]
+    rows, errs = tp.scan_crypto(list(tp.CRYPTO_PAIRS), scan_args())
+    log_scan_errors("crypto", errs, trades)
+    flags = candidate_flags(rows, "crypto", state, "kraken")
     prices = {r["pair"]: r["price"] for r in rows}
     missing = [tp.norm_pair(t["pair"]) for t in trades if t["pair"].upper() not in prices]
     if missing:
@@ -404,12 +434,12 @@ def stocks_cycle(state, now, all_markets=False):
         return [], 0
     tp._FX.clear()
     rows, errs = tp.scan_stocks(syms + pos_syms, scan_args())
-    if errs:
-        log.warning("stock scan errors: %s", errs)
-    flags = candidate_flags([r for r in rows if r["symbol"] in syms], "stocks", state, "t212")
+    log_scan_errors("stock", errs, trades)
+    watch_rows = [r for r in rows if r["symbol"] in syms]
+    flags = candidate_flags(watch_rows, "stocks", state, "t212")
     prices = {r["symbol"].upper(): r["price"] for r in rows}
     flags += position_flags(trades, prices, "t212", state)
-    return flags, len(rows)
+    return flags, len(watch_rows)   # count watchlist symbols only (position-only symbols not revealed)
 
 # ----------------------------------------------------------------------------- dispatch
 def append_alert(rec):
@@ -491,8 +521,9 @@ def handle_flags(flags, state, now, dry_run=False, poster=post_webhook):
         if lk and rec["action"] in ("wake", "session_due", "not_configured"):
             state["levels_fired"][lk] = now.isoformat()
         msg = f"FLAG {fl['account']} {fl['symbol']} {fl['reason']} -> {rec['action']}: {fl['detail']}"
-        if CLOUD and fl["reason"] in POSITION_REASONS:   # public Actions logs: never reveal positions
-            msg = f"FLAG position check -> {rec['action']}"
+        if CLOUD:   # public Actions logs: no symbols / details (the webhook payload carries them)
+            msg = (f"FLAG position check -> {rec['action']}" if fl["reason"] in POSITION_REASONS
+                   else f"FLAG {fl['account']} {fl['reason']} -> {rec['action']}")
         if action == "not_configured":
             msg += " (box log-only: CLOUD_WATCHER=1)" if cloud_watcher_active() else " (webhook not configured)"
         if action == "session_due":
@@ -513,7 +544,13 @@ def run_cycle(kind, state, now, dry_run=False, all_markets=False):
         else:
             flags, n = stocks_cycle(state, now, all_markets)
     except Exception as e:  # network etc. -> retry next cycle
-        log.warning("%s cycle failed (retry next cycle): %s", kind, str(e)[:300])
+        err = str(e)[:300]
+        if CLOUD:
+            try:
+                err = mask_text(err, _held_keys(open_trades()))
+            except Exception:
+                err = type(e).__name__
+        log.warning("%s cycle failed (retry next cycle): %s", kind, err)
         return []
     res = handle_flags(flags, state, now, dry_run)
     if CLOUD:
@@ -596,8 +633,7 @@ def cloud_once(state_dir, dry_run=False, all_markets=False):
         if os.path.exists(ALERTS) and os.path.getsize(ALERTS) > 200_000:   # keep the cached state small
             lines = open(ALERTS).readlines()[-500:]
             open(ALERTS, "w").writelines(lines)
-    summary = [dict(account=r["account"], reason=r["reason"], action=r["action"],
-                    symbol="(position)" if r["reason"] in POSITION_REASONS else r["symbol"]) for r in res]
+    summary = [dict(account=r["account"], reason=r["reason"], action=r["action"]) for r in res]   # public log: no symbols
     print(json.dumps(dict(time=now.isoformat(), flags=summary, batches=batches, pending=len(read_pending())),
                      indent=1, default=str))
     return 0

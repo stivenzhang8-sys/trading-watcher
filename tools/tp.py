@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tp.py - deterministic trading toolkit for Stiven's Kraken (spot) and Trading 212 sessions.
+"""tp.py - deterministic trading toolkit for Kraken (spot) and Trading 212 trading sessions.
 
 READ-ONLY: this tool never places, cancels or modifies orders. It only calls
 public market-data endpoints, `kraken balance` / `kraken open-orders` (read-only

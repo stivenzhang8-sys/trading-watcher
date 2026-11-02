@@ -242,6 +242,63 @@ def test_cloud_log_redacts_positions():
     out = buf.getvalue()
     assert "position check" in out and "POSEUR" not in out and "19.25" not in out
 
+def _capture_cloud(fn):
+    import logging, io
+    buf = io.StringIO(); h = logging.StreamHandler(buf); w.log.addHandler(h); w.log.setLevel(logging.INFO)
+    w.CLOUD = True
+    try:
+        out = fn()
+    finally:
+        w.CLOUD = False; w.log.removeHandler(h)
+    return buf.getvalue(), out
+
+def test_cloud_log_hides_candidate_symbols_but_webhook_keeps_them():
+    calls = []
+    os.environ["WATCH_WEBHOOK_URL"] = "http://invalid.example/never"
+    try:
+        f = dict(fl(sym="CANDEUR"), detail="mom20 12.3 above sma20")
+        logs, res = _capture_cloud(lambda: w.handle_flags([f, fl(sym="NEAREUR", reason="near_candidate")], st(), QUIET,
+                                                          poster=poster_ok(calls)))
+    finally:
+        os.environ.pop("WATCH_WEBHOOK_URL")
+    assert "CANDEUR" not in logs and "NEAREUR" not in logs and "12.3" not in logs
+    assert "FLAG kraken candidate -> wake" in logs and "FLAG kraken near_candidate -> wake" in logs
+    assert [c["symbol"] for c in calls] == ["CANDEUR", "NEAREUR"]          # secret channel keeps full details
+    assert calls[0]["metrics"]["detail"] == "mom20 12.3 above sma20"
+    # box mode unchanged: symbol + detail logged
+    import logging, io
+    buf = io.StringIO(); h = logging.StreamHandler(buf); w.log.addHandler(h)
+    try:
+        w.handle_flags([dict(fl(sym="BOXEUR"), detail="d1")], st(), QUIET, dry_run=True)
+    finally:
+        w.log.removeHandler(h)
+    assert "BOXEUR" in buf.getvalue()
+
+def test_cloud_scan_errors_mask_held_positions():
+    trades = [dict(id="1", account="t212", pair="HELD.DE")]
+    errs = {"HELD.DE": "HTTP 404 for HELD.DE", "PUB.DE": "timeout (see HELD.DE)"}
+    logs, _ = _capture_cloud(lambda: w.log_scan_errors("stock", errs, trades))
+    assert "HELD.DE" not in logs and "PUB.DE" in logs and "+1 position symbol error" in logs
+    import logging, io
+    buf = io.StringIO(); h = logging.StreamHandler(buf); w.log.addHandler(h)
+    try:
+        w.log_scan_errors("stock", errs, trades)   # box log keeps everything
+    finally:
+        w.log.removeHandler(h)
+    assert "HELD.DE" in buf.getvalue()
+
+def test_stocks_cycle_counts_watchlist_only():
+    orig = (w.stock_symbols, w.open_trades, w.tp.scan_stocks, w.market_open)
+    w.stock_symbols = lambda: ["AAA", "BBB"]
+    w.open_trades = lambda: [dict(id="1", account="t212", pair="POS1", entry="10", stop="9", initial_stop="9")]
+    w.market_open = lambda s, now: True
+    w.tp.scan_stocks = lambda syms, a: ([dict(symbol=s, price=10.0) for s in syms], {})
+    try:
+        flags, n = w.stocks_cycle(st(), QUIET)
+    finally:
+        w.stock_symbols, w.open_trades, w.tp.scan_stocks, w.market_open = orig
+    assert n == 2
+
 if __name__ == "__main__":
     n = 0
     for k, f in list(globals().items()):
