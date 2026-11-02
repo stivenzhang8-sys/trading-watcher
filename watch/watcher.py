@@ -80,7 +80,7 @@ def _cloud_flag():
     return (v or "").strip().lower() in ("1", "true", "yes", "on")
 
 def cloud_healthy():
-    """Heartbeat: newest successful *scheduled* run of watcher.yml is < CLOUD_STALE_MIN old (gh CLI, checked
+    """Heartbeat: newest successful scheduled or dispatched run of watcher.yml is < CLOUD_STALE_MIN old (gh CLI, checked
     at most every 10 min). If GitHub's schedule stalls, the box automatically resumes sending webhooks.
     gh errors keep the last good answer for 60 min, then count as unhealthy. WATCH_CLOUD_HEALTHCHECK=0 disables."""
     if os.environ.get("WATCH_CLOUD_HEALTHCHECK", "1") == "0":
@@ -91,11 +91,13 @@ def cloud_healthy():
     import subprocess
     ok, why = None, ""
     try:
-        out = subprocess.run(["gh", "run", "list", "-R", CLOUD_REPO, "-w", "watcher.yml", "-e", "schedule",
-                              "-s", "success", "-L", "1", "--json", "createdAt,updatedAt"],
+        # scheduled runs AND workflow_dispatch runs (cron-job.org triggers the workflow every 10 min via the API)
+        out = subprocess.run(["gh", "run", "list", "-R", CLOUD_REPO, "-w", "watcher.yml",
+                              "-s", "success", "-L", "10", "--json", "createdAt,updatedAt,event"],
                              capture_output=True, text=True, timeout=30)
         if out.returncode == 0:
-            runs = json.loads(out.stdout or "[]")
+            runs = [r for r in json.loads(out.stdout or "[]") if r.get("event") in ("schedule", "workflow_dispatch")]
+            runs.sort(key=lambda r: r["updatedAt"], reverse=True)
             if runs:
                 t = max(dt.datetime.fromisoformat(runs[0][k].replace("Z", "+00:00")).timestamp()
                         for k in ("createdAt", "updatedAt"))
