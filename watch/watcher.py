@@ -524,6 +524,8 @@ def handle_flags(flags, state, now, dry_run=False, poster=post_webhook):
         if CLOUD:   # public Actions logs: no symbols / details (the webhook payload carries them)
             msg = (f"FLAG position check -> {rec['action']}" if fl["reason"] in POSITION_REASONS
                    else f"FLAG {fl['account']} {fl['reason']} -> {rec['action']}")
+        if rec["action"] == "post_failed":
+            msg += f" (HTTP {rec.get('http_status')}; {rec.get('error', '')[:80]})" if CLOUD else f" (HTTP {rec.get('http_status')}; {rec.get('error', '')})"
         if action == "not_configured":
             msg += " (box log-only: CLOUD_WATCHER=1)" if cloud_watcher_active() else " (webhook not configured)"
         if action == "session_due":
@@ -531,8 +533,8 @@ def handle_flags(flags, state, now, dry_run=False, poster=post_webhook):
         log.info(msg)
         if not dry_run:
             append_alert(rec)
-            if rec["action"] in ("cap", "session_due"):
-                add_pending(rec)
+            if rec["action"] in ("cap", "session_due", "post_failed"):
+                add_pending(rec)   # a failed POST must not lose a transition-only flag: retried as a pending batch
         results.append(rec)
     return results
 
@@ -582,7 +584,7 @@ def send_pending_batches(state, now, dry_run=False, poster=post_webhook, woke=Fa
     items = read_pending()
     for acct in ("kraken", "t212"):
         mine = [i for i in items if i.get("account") == acct]
-        if not any(i.get("suppressed_by") == "cap" for i in mine):
+        if not any(i.get("suppressed_by") in ("cap", "post_failed") for i in mine):
             continue
         if wakes_today(state, now) >= DAILY_CAP or session_due_soon(acct, now)[0]:
             continue

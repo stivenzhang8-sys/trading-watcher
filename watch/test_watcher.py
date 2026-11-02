@@ -57,6 +57,20 @@ def test_failed_post_not_counted():
     assert r[0]["action"] == "post_failed" and s["wakes"] != [] and again_soon == [] and later[0]["action"] == "wake"
     assert len(s["wakes"]) == 1
 
+def test_failed_post_goes_pending_and_is_retried_as_batch():
+    s = st(); _reset_pending(); calls = []
+    os.environ["WATCH_WEBHOOK_URL"] = "http://invalid.example/never"
+    w.CLOUD = True
+    try:
+        mon = dt.datetime(2026, 11, 2, 0, 30, tzinfo=R)
+        r = w.handle_flags([fl(sym="TTT", acct="t212")], s, mon, poster=lambda p: 503)
+        assert r[0]["action"] == "post_failed" and [i["key"] for i in w.read_pending()] == ["t212:TTT:candidate"]
+        assert w.read_pending()[0]["suppressed_by"] == "post_failed"
+        b = w.send_pending_batches(s, mon + dt.timedelta(minutes=10), poster=poster_ok(calls))
+        assert b and b[0]["account"] == "t212" and calls[-1]["pending"][0]["symbol"] == "TTT" and w.read_pending() == []
+    finally:
+        w.CLOUD = False; os.environ.pop("WATCH_WEBHOOK_URL")
+
 def test_not_configured():
     s = st()
     r = w.handle_flags([fl()], s, QUIET, poster=lambda p: (_ for _ in ()).throw(AssertionError("posted")))
