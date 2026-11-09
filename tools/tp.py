@@ -709,7 +709,11 @@ def scan_crypto(pairs, args):
     fees = fee_model("kraken", tp_fee=args.tp_fee)
     out, errs = [], {}
     btc_mom = None
+    net_fails = 0   # circuit breaker: after 3 consecutive network failures skip the rest so a pass can't hang for minutes
     for p in pairs:
+        if net_fails >= 3:
+            errs[p] = "skipped: Kraken API unreachable (3 consecutive failures)"
+            continue
         try:
             h, l, c, lastts = kraken_daily(p)
             t = tick[p]
@@ -737,9 +741,12 @@ def scan_crypto(pairs, args):
             if p == "XBTEUR":
                 btc_mom = m["mom20_pct"]
             out.append(row)
+            net_fails = 0
             time.sleep(0.35)
         except Exception as e:
             errs[p] = str(e)[:200]
+            if "GET failed" in str(e):
+                net_fails += 1
     for r in out:
         r["rs_vs_btc20_pct"] = rnd(r["mom20_pct"] - btc_mom, 2) if btc_mom is not None and r["mom20_pct"] is not None else None
     out.sort(key=lambda r: (not r["candidate"], -(r["mom20_pct"] or -999)))
