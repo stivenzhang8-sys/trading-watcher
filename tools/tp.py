@@ -388,6 +388,18 @@ def norm_pair(p):
         p += "EUR"
     return p
 
+def is_yahoo_symbol(sym):
+    """True for T212 / Yahoo equity-ETF tickers (exchange suffix like .DE, .MI, .PA)."""
+    return bool(sym) and "." in str(sym).strip()
+
+def resolve_daily_atr(pair, account="kraken"):
+    """14-day Wilder ATR from Yahoo for stocks/ETFs, Kraken OHLC for crypto pairs."""
+    if account == "t212" or is_yahoo_symbol(pair):
+        y = yahoo_daily(pair)
+        return atr_wilder(y["h"], y["l"], y["c"], 14)
+    h, l, c, _ = kraken_daily(norm_pair(pair))
+    return atr_wilder(h, l, c, 14)
+
 def kraken_daily(pair):
     res = kraken_public("OHLC", pair=pair, interval=1440)
     key = [k for k in res if k != "last"][0]
@@ -794,14 +806,14 @@ def cmd_scan(args):
 
 def resolve_market(args, account):
     """Returns (atr, ccy, fx, pairinfo, last_price)."""
-    if account == "kraken":
+    if account == "kraken" and not is_yahoo_symbol(args.pair):
         p = norm_pair(args.pair); args.pair = p
         pi = kraken_pairinfo().get(p) or {}
         atr = args.atr; last = None
         if atr is None and args.atr_pct is not None:
             atr = args.entry * args.atr_pct / 100
         if atr is None:
-            h, l, c, _ = kraken_daily(p); atr = atr_wilder(h, l, c, 14)
+            atr = resolve_daily_atr(p, "kraken")
         return atr, "EUR", 1.0, pi, last
     ccy = args.ccy
     atr = args.atr
@@ -915,10 +927,10 @@ def cmd_trail(args):
     if atr is None:
         if args.atr_pct is not None:
             atr = args.price * args.atr_pct / 100
-        elif args.pair and args.account == "kraken":
-            h, l, c, _ = kraken_daily(norm_pair(args.pair)); atr = atr_wilder(h, l, c, 14)
         elif args.pair:
-            y = yahoo_daily(args.pair); atr = atr_wilder(y["h"], y["l"], y["c"], 14)
+            # Stocks/ETFs (DB1.DE, …) always use Yahoo — even if --account was left at the
+            # default "kraken" (T212 session rules historically omit --account on trail).
+            atr = resolve_daily_atr(args.pair, args.account)
         else:
             raise SystemExit("need --atr, --atr-pct or --pair")
     hc = args.highest_close
