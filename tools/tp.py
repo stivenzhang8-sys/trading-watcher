@@ -26,6 +26,7 @@ CFG = {
         fee_target=0.008,      # conservative: taker exit (use --tp-fee 0.004 for a resting limit TP)
         min_stop_atr=1.5, min_stop_pct=3.0, min_rr_net=2.0, max_target_atr=4.0,
         max_open=3, max_open_risk_pct=3.0, cooldown_h=24, max_trips_month=12,
+        trail_atr=2.0,         # from +2R: trail N x daily ATR below highest close
         equity_floor=0.0,      # real start_capital / equity_floor: tools/account.local.json
     ),
     "t212": dict(
@@ -33,6 +34,7 @@ CFG = {
         fx_fee=0.0015,         # per leg, only for non-EUR instruments
         min_stop_atr=2.0, min_stop_pct=0.0, min_rr_net=2.0, max_target_atr=4.5,
         max_open=3, max_open_risk_pct=4.0, cooldown_h=24, max_trips_month=12,
+        trail_atr=3.0,         # weekly research 2026-11-15: 3xATR trail beat 2x on 151 stocks (E +0.16R -> +0.20R)
         equity_floor=0.0, qty_decimals=4, min_notional_eur=1.0,
     ),
 }
@@ -941,7 +943,12 @@ def cmd_trail(args):
         else:
             raise SystemExit("need --atr, --atr-pct or --pair")
     hc = args.highest_close
-    t = trail_stop(args.entry, args.initial_stop, args.price, hc, atr, args.current_stop)
+    k = args.trail_atr
+    if k is None:
+        # stocks/ETFs use the t212 multiplier even if --account was left at the default
+        acct = "t212" if (args.account == "t212" or is_yahoo_symbol(args.pair)) else "kraken"
+        k = CFG[acct].get("trail_atr", 2.0)
+    t = trail_stop(args.entry, args.initial_stop, args.price, hc, atr, args.current_stop, trail_atr=k)
     t.update(atr=rnd(atr, 8))
     if args.decimals is not None:
         t["recommended_stop"] = floor_dec(t["recommended_stop"], args.decimals)
@@ -1008,6 +1015,7 @@ def build_parser():
     s.add_argument("--current-stop", type=float); s.add_argument("--price", type=float, required=True)
     s.add_argument("--highest-close", type=float); s.add_argument("--atr", type=float); s.add_argument("--atr-pct", type=float)
     s.add_argument("--decimals", type=int)
+    s.add_argument("--trail-atr", type=float, help="override trailing ATR multiple (default: kraken 2.0, t212 3.0)")
 
     s = sub.add_parser("log"); s.add_argument("action", choices=["open", "close", "update-stop"])
     s.add_argument("--id"); s.add_argument("--account", choices=["kraken", "t212"]); s.add_argument("--pair")
