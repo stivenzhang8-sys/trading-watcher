@@ -610,16 +610,37 @@ def kraken_state(rows=None):
                 positions=positions, open_positions=len(positions), open_risk_eur=round(open_risk, 4),
                 open_orders=len(oo))
 
+def t212_manual_tickers():
+    """Owner long-term holdings listed in account.local.json t212.manual_holdings.
+    Not strategy: excluded from open_positions / open_risk; sessions must not stop or close them."""
+    out = set()
+    for x in (CFG.get("t212") or {}).get("manual_holdings") or []:
+        t = str(x).strip().upper()
+        if t:
+            out.add(t)
+    return out
+
+def is_t212_manual_holding(ticker, manual=None):
+    manual = t212_manual_tickers() if manual is None else manual
+    t = (ticker or "").upper()
+    if not t:
+        return False
+    if t in manual:
+        return True
+    head = t.split("_")[0].split(".")[0]
+    return any(head == m.split("_")[0].split(".")[0] for m in manual)
+
 def t212_state():
     cash = t212_get("/equity/account/cash")
     pf = t212_get("/equity/portfolio")
     orders = t212_get("/equity/orders")
+    manual = t212_manual_tickers()
     stops = {}
     for o in orders:
         if o.get("type") in ("STOP", "STOP_LIMIT") and float(o.get("quantity", 0)) < 0:
             s = stops.setdefault(o["ticker"], dict(qty=0.0, price=0.0))
             s["qty"] += -float(o["quantity"]); s["price"] = max(s["price"], float(o.get("stopPrice") or 0))
-    positions, open_risk = [], 0.0
+    positions, manual_positions, open_risk = [], [], 0.0
     for p in pf:
         t = p["ticker"]; q = float(p["quantity"]); avg = float(p["averagePrice"]); px = float(p["currentPrice"])
         ccy = "USD" if t.endswith("_US_EQ") else "EUR"
@@ -629,12 +650,26 @@ def t212_state():
             fx = 1.0
         st = stops.get(t); covered = min(q, st["qty"]) if st else 0.0
         risk = (covered * max(0.0, avg - st["price"]) if st else 0.0) * fx + (q - covered) * px * fx
+        row = dict(ticker=t, qty=q, avg=avg, price=px, stop=st["price"] if st else None,
+                   unprotected_qty=q - covered, risk_eur=round(risk, 4))
+        if is_t212_manual_holding(t, manual):
+            row["manual"] = True
+            manual_positions.append(row)
+            continue
         open_risk += risk
-        positions.append(dict(ticker=t, qty=q, avg=avg, price=px, stop=st["price"] if st else None,
-                              unprotected_qty=q - covered, risk_eur=round(risk, 4)))
+        positions.append(row)
+    manual_orders = []
+    for o in orders:
+        if not is_t212_manual_holding(o.get("ticker"), manual):
+            continue
+        manual_orders.append(dict(id=o.get("id"), ticker=o.get("ticker"), type=o.get("type"),
+                                  side=o.get("side"), status=o.get("status"),
+                                  quantity=o.get("quantity"), value=o.get("value"),
+                                  filledValue=o.get("filledValue"), limitPrice=o.get("limitPrice"),
+                                  currency=o.get("currency")))
     return dict(equity_eur=float(cash.get("total", 0)), cash_eur=float(cash.get("free", 0)),
                 positions=positions, open_positions=len(positions), open_risk_eur=round(open_risk, 4),
-                open_orders=len(orders))
+                open_orders=len(orders), manual_positions=manual_positions, manual_orders=manual_orders)
 
 # ----------------------------------------------------------------------------- gate (pure)
 def gate(account, entry, stop, target, atr, fees, equity, open_positions, open_risk_eur,
@@ -791,8 +826,22 @@ def scan_stocks(syms, args):
             out.append(row)
         except Exception as e:
             errs[s] = str(e)[:200]
-    out.sort(key=lambda r: (not r["candidate"], -(r["mom63_pct"] or -999)))
-    return out, errs
+    return rank_stock_rows(out), errs
+
+def rank_stock_rows(rows):
+    """Candidates first, ordered by 3-month momentum (mom63) descending; candidates get rank 1..n.
+    Weekly research 2026-11-22 (research/w1122/slots.py): with 7 slots and 1 entry/day, taking the
+    top-mom63 candidate beat a random pick (E +0.33R vs +0.12R in-sample, +0.18R vs +0.06R on 100
+    out-of-sample symbols) and skipping 1-month "spikes" (mom20 > 12%) cut it to +0.23R / +0.07R.
+    Sessions take the best-ranked candidate that passes the hard filters (sector, EUR, earnings, check)."""
+    rows.sort(key=lambda r: (not r["candidate"], -(r["mom63_pct"] if r.get("mom63_pct") is not None else -999)))
+    k = 0
+    for r in rows:
+        if r["candidate"]:
+            k += 1; r["rank"] = k
+        else:
+            r["rank"] = None
+    return rows
 
 def cmd_scan(args):
     if args.mode == "crypto":
@@ -806,9 +855,9 @@ def cmd_scan(args):
         syms = args.symbols.split(",") if args.symbols else (
             read_watchlist(wl) if wl else STOCK_WATCHLIST)
         rows, errs = scan_stocks(syms, args)
-        human = [f"Stocks daily scan (Yahoo) {now_local():%Y-%m-%d %H:%M} (Europe/Rome). Candidate = price>SMA20>SMA50, SMA20 rising, 20d mom>0, 6m mom>0"]
+        human = [f"Stocks daily scan (Yahoo) {now_local():%Y-%m-%d %H:%M} (Europe/Rome). Candidate = price>SMA20>SMA50, SMA20 rising, 20d mom>0, 6m mom>0. #rank = mom63 order (take the best-ranked that passes sector/EUR/earnings/check; no mom20 spike skip)"]
         for r in rows[:args.top]:
-            human.append(f"{'*' if r['candidate'] else ' '} {r['symbol']:8} {r['currency']} {r['price']:<10g} ATR {r['atr_pct']:>5}%  mom20 {r['mom20_pct']:>6}%  mom63 {r['mom63_pct']}%  mom126 {r['mom126_pct']}%  stop<= {r['min_stop_price']} tgt2R>= {r['target_for_2R_net']}")
+            human.append(f"{('#' + str(r['rank'])) if r.get('rank') else '  ':>4} {r['symbol']:8} {r['currency']} {r['price']:<10g} ATR {r['atr_pct']:>5}%  mom20 {r['mom20_pct']:>6}%  mom63 {r['mom63_pct']}%  mom126 {r['mom126_pct']}%  stop<= {r['min_stop_price']} tgt2R>= {r['target_for_2R_net']}")
     cands = [r.get("pair") or r.get("symbol") for r in rows if r["candidate"]]
     human.append(f"Candidates: {', '.join(cands) if cands else 'none'}" + (f" | errors: {list(errs)}" if errs else ""))
     emit(dict(mode=args.mode, time=now_local().isoformat(), candidates=cands, rows=rows, errors=errs), human, args)
@@ -982,7 +1031,19 @@ def cmd_stats(args):
 
 def cmd_state(args):
     st = kraken_state() if args.account == "kraken" else t212_state()
-    emit(st, [f"{args.account}: equity {st['equity_eur']} EUR, cash {st['cash_eur']}, positions {st['open_positions']}, open risk {st['open_risk_eur']} EUR"], args)
+    human = [f"{args.account}: equity {st['equity_eur']} EUR, cash {st['cash_eur']}, positions {st['open_positions']}, open risk {st['open_risk_eur']} EUR"]
+    man = st.get("manual_positions") or []
+    pending = st.get("manual_orders") or []
+    if man or pending:
+        bits = []
+        if man:
+            bits.append("held " + ", ".join(f"{p['ticker']} x{p['qty']}" for p in man))
+        if pending:
+            bits.append("pending " + ", ".join(
+                f"{o.get('ticker')} {o.get('type')} {o.get('side') or ''} id {o.get('id')}".strip()
+                for o in pending))
+        human.append("manual holdings (outside strategy; do not stop, close, or cancel): " + "; ".join(bits))
+    emit(st, human, args)
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
