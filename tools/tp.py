@@ -91,7 +91,18 @@ def kraken_cli(*args):
         raise RuntimeError(f"kraken {args[0]} failed: {out.stderr.strip()[:200]}")
     return json.loads(out.stdout)
 
+def _load_t212_envfile():
+    """Fallback: private key file on the box (never committed; /tools/* is gitignored)."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".t212.env")
+    if os.path.exists(p):
+        for line in open(p):
+            if "=" in line:
+                n, v = line.strip().split("=", 1)
+                if n in ("T212_API_KEY", "T212_API_SECRET") and v:
+                    os.environ[n] = v
+
 def t212_get(path):
+    _load_t212_envfile()
     k, s = os.environ.get("T212_API_KEY"), os.environ.get("T212_API_SECRET")
     if not k or not s:
         raise RuntimeError("T212_API_KEY/T212_API_SECRET not set")
